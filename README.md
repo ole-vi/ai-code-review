@@ -128,7 +128,7 @@ review origin/master...HEAD
 review origin/main...HEAD
 ```
 
-*Compare two models side-by-side (this is a good go-to review command)*:
+**Compare two models side-by-side (This works well as a go-to review command)**:
 
 ```bash
 review --models "gpt-4o,gemini-2.0-flash" origin/master...HEAD
