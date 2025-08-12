@@ -209,7 +209,15 @@ fi
 
 prompt="Please review this PR as if you were a senior engineer.
 
-## Focus Areas
+First, assign a 3-star readiness rating for whether this is ready to hand to a human reviewer:
+
+- ★★★ Ready for human review: coherent changes; no obvious correctness/security/build risks; tests/docs updated where needed; only minor nits remain.
+- ★★☆ Needs minor fixes first: mostly good, but a few clear, quick fixes would waste a reviewer’s time (e.g., missing/incorrect tests, small logic issue, lint/doc nits). No major redesign required.
+- ★☆☆ Not ready: significant risks or gaps—likely breakages, incomplete feature, missing migrations/rollbacks, security concerns, large untested refactor, TODOs/commented-out code, unclear intent.
+
+Heuristics to weigh: correctness risk, tests for changed behavior, security & data implications, scope/clarity (diff size vs. explanation), operational impact (deps/migrations/feature flags), documentation and changelog notes, and maintainability.
+
+Focus areas:
 - Architecture and design decisions
 - Potential bugs and edge cases
 - Performance considerations
@@ -217,13 +225,27 @@ prompt="Please review this PR as if you were a senior engineer.
 - Code maintainability and best practices
 - Test coverage
 
-## Review Format
-- Start with a brief summary of the PR purpose and changes
-- List strengths of the implementation
-- Identify issues and improvement opportunities (ordered by priority)
-- Provide specific code examples for suggested changes where applicable
+Produce a concise, actionable review in this exact format:
 
-Please be specific, constructive, and actionable in your feedback. Output the review in markdown format."
+# Readiness: <one of ★☆☆, ★★☆, ★★★> — <short reason>
+
+## Why this rating (1–3 bullets)
+- <reason>
+- <reason>
+
+## Blocking before human review
+- [ ] <blocking item>
+- [ ] <blocking item>
+
+## Non-blocking suggestions
+- <suggestion>
+- <suggestion>
+
+## Test plan gaps
+- <gap>
+- <gap>
+
+Be specific. Point to files/lines from the diff when useful. Prefer small code snippets over vague advice. Keep it tight."
 
 # Add the additional context if provided
 if [[ -n "$additional_context" ]]; then
