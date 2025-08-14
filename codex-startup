@@ -88,7 +88,7 @@ else
 fi
 
 # Default model list (fix Claude id: drop provider prefix)
-DEFAULT_MODELS='gpt-4o,gemini/gemini-1.5-flash-latest,claude-3-7-sonnet-latest'
+DEFAULT_MODELS='gpt-4o,gemini/gemini-1.5-flash-latest,claude-3-5-sonnet-latest'
 if [[ -z "${LLM_MODELS:-}" ]]; then
   export LLM_MODELS="$DEFAULT_MODELS"
   append_once_to_bashrc 'export LLM_MODELS=${LLM_MODELS:-'"$DEFAULT_MODELS"'}'
@@ -124,7 +124,7 @@ fi
 # -----------------------------
 mkdir -p tools
 
-# Pre-PR review runner (uses fixed Claude id)
+# Pre-PR review runner (now with Claude auto-detect + model filtering)
 cat > tools/pre_pr_review.sh <<"EOF"
 #!/usr/bin/env bash
 set -euo pipefail
@@ -150,8 +150,59 @@ fi
 
 COMPARE_RANGE="${COMPARE_RANGE:-${BASE}...HEAD}"
 
-# Use corrected Claude id (no anthropic/ prefix)
-MODELS="${LLM_MODELS:-gpt-4o,gemini/gemini-1.5-flash-latest,claude-3-7-sonnet-latest}"
+# --- Claude model auto-detection to avoid "Unknown model" ---
+detect_claude_sonnet() {
+  local candidates=(
+    "claude-3-5-sonnet-20241022"
+    "claude-3-5-sonnet-latest"
+    "claude-3-5-sonnet"
+    "claude-3-sonnet-20240229"
+    "claude-3-sonnet"
+  )
+  local available
+  available="$(llm models -n 2>/dev/null || true)"
+  for m in "${candidates[@]}"; do
+    if printf '%s\n' "$available" | grep -qx "$m"; then
+      printf '%s' "$m"
+      return 0
+    fi
+  done
+  return 1
+}
+
+build_models() {
+  local base="gpt-4o,gemini/gemini-1.5-flash-latest"
+  local claude_model=""
+  claude_model="$(detect_claude_sonnet || true)"
+
+  # If user supplied LLM_MODELS, filter it to only those actually installed.
+  if [ -n "${LLM_MODELS:-}" ]; then
+    local filtered=""
+    local available
+    IFS=',' read -r -a requested <<<"$LLM_MODELS"
+    available="$(llm models -n 2>/dev/null || true)"
+    for m in "${requested[@]}"; do
+      m="$(printf '%s' "$m" | awk '{$1=$1};1')" # trim
+      if printf '%s\n' "$available" | grep -qx "$m"; then
+        filtered="${filtered:+$filtered,}$m"
+      fi
+    done
+    if [ -n "$filtered" ]; then
+      printf '%s' "$filtered"
+      return
+    fi
+    # else fall back to auto-build
+  fi
+
+  if [ -n "$claude_model" ]; then
+    printf '%s,%s' "$base" "$claude_model"
+  else
+    echo "Note: no supported Claude Sonnet model found (skipping Claude)." >&2
+    printf '%s' "$base"
+  fi
+}
+
+MODELS="$(build_models)"
 OUT="${OUT:-.ai-review.md}"
 
 echo ">>> Running AI review for ${COMPARE_RANGE} with models: ${MODELS}"
