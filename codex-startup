@@ -48,12 +48,6 @@ sudo chmod +x /usr/local/bin/review
 
 # -----------------------------
 # Wire secrets to llm (persist + env)
-#   - OPENAI_API_KEY
-#   - ANTHROPIC_API_KEY
-#   - GOOGLE_API_KEY -> LLM_GEMINI_KEY
-# Notes:
-#   * Use --value to avoid interactive hangs
-#   * Also write exports to ~/.bashrc so shells have env fallbacks
 # -----------------------------
 log "Wire secrets to llm (persist + env)"
 
@@ -77,7 +71,7 @@ else
   echo "Anthropic key: MISSING"
 fi
 
-# Gemini (map GOOGLE_API_KEY -> LLM_GEMINI_KEY used by llm-gemini)
+# Gemini
 if [[ -n "${GOOGLE_API_KEY:-}" ]]; then
   export LLM_GEMINI_KEY="$GOOGLE_API_KEY"
   llm keys set gemini --value "$LLM_GEMINI_KEY" >/dev/null
@@ -87,7 +81,7 @@ else
   echo "Gemini key: MISSING (no GOOGLE_API_KEY secret)"
 fi
 
-# Default model list (fix Claude id: drop provider prefix)
+# Default model list
 DEFAULT_MODELS='gpt-4o,gemini/gemini-1.5-flash-latest,claude-3-5-sonnet-latest'
 if [[ -z "${LLM_MODELS:-}" ]]; then
   export LLM_MODELS="$DEFAULT_MODELS"
@@ -113,34 +107,29 @@ else
   fi
 fi
 
-# If this is running inside a repo, try to set gh default (best-effort)
 if [[ -d .git ]] && have gh; then
   log "Configuring gh default for current repo (best-effort)"
   gh repo set-default "$(git remote get-url origin 2>/dev/null | sed -E 's#https?://github.com/##; s/\.git$//')" || true
 fi
 
 # -----------------------------
-# Write helper scripts
+# Helper scripts
 # -----------------------------
 mkdir -p tools
 
-# Pre-PR review runner (now with Claude auto-detect + model filtering)
+# Pre-PR review runner
 cat > tools/pre_pr_review.sh <<"EOF"
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Activate llm venv if present
 if [ -f "$HOME/.llm-env/bin/activate" ]; then
-  # shellcheck disable=SC1091
   source "$HOME/.llm-env/bin/activate"
 fi
 export PATH="$HOME/.llm-env/bin:$PATH"
 
-# Determine default branch (prefer remote HEAD if available)
 DEFAULT_BRANCH="${DEFAULT_BRANCH:-$(git remote show origin 2>/dev/null | sed -n '/HEAD branch/s/.*: //p')}"
 DEFAULT_BRANCH="${DEFAULT_BRANCH:-master}"
 
-# Ensure we have the base ref locally if origin exists
 if git remote get-url origin >/dev/null 2>&1; then
   git fetch origin "$DEFAULT_BRANCH" --depth=1 >/dev/null 2>&1 || true
   BASE="origin/${DEFAULT_BRANCH}"
@@ -150,7 +139,6 @@ fi
 
 COMPARE_RANGE="${COMPARE_RANGE:-${BASE}...HEAD}"
 
-# --- Claude model auto-detection to avoid "Unknown model" ---
 detect_claude_sonnet() {
   local candidates=(
     "claude-3-5-sonnet-20241022"
@@ -175,14 +163,13 @@ build_models() {
   local claude_model=""
   claude_model="$(detect_claude_sonnet || true)"
 
-  # If user supplied LLM_MODELS, filter it to only those actually installed.
   if [ -n "${LLM_MODELS:-}" ]; then
     local filtered=""
     local available
     IFS=',' read -r -a requested <<<"$LLM_MODELS"
     available="$(llm models -n 2>/dev/null || true)"
     for m in "${requested[@]}"; do
-      m="$(printf '%s' "$m" | awk '{$1=$1};1')" # trim
+      m="$(printf '%s' "$m" | awk '{$1=$1};1')"
       if printf '%s\n' "$available" | grep -qx "$m"; then
         filtered="${filtered:+$filtered,}$m"
       fi
@@ -191,7 +178,6 @@ build_models() {
       printf '%s' "$filtered"
       return
     fi
-    # else fall back to auto-build
   fi
 
   if [ -n "$claude_model" ]; then
@@ -211,7 +197,7 @@ echo ">>> Review saved to ${OUT}"
 EOF
 chmod +x tools/pre_pr_review.sh
 
-# Auto-fix helper (unchanged except for venv activation)
+# Auto-fix helper
 cat > tools/auto_fix_from_review.sh <<"EOF"
 #!/usr/bin/env bash
 set -euo pipefail
@@ -220,9 +206,7 @@ REVIEW_FILE="${1:-.ai-review.md}"
 MODEL="${MODEL:-gpt-4o-mini}"
 PATCH_FILE="${PATCH_FILE:-.ai-autofix.patch}"
 
-# Activate llm venv if present
 if [ -f "$HOME/.llm-env/bin/activate" ]; then
-  # shellcheck disable=SC1091
   source "$HOME/.llm-env/bin/activate"
 fi
 export PATH="$HOME/.llm-env/bin:$PATH"
@@ -288,6 +272,48 @@ fi
 EOF
 chmod +x tools/auto_fix_from_review.sh
 
+# Meta-runner for Codex "Code" button
+cat > tools/code.sh <<"EOF"
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ -f "$HOME/.llm-env/bin/activate" ]; then
+  source "$HOME/.llm-env/bin/activate"
+fi
+export PATH="$HOME/.llm-env/bin:$PATH"
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$REPO_ROOT" ]; then
+  echo "Not inside a Git repository."
+  exit 1
+fi
+cd "$REPO_ROOT"
+
+OUT="${OUT:-.ai-review.md}"
+
+echo ">>> [1/3] Pre-review"
+bash tools/pre_pr_review.sh
+
+echo ">>> [2/3] Auto-fix"
+bash tools/auto_fix_from_review.sh "$OUT" || true
+
+echo ">>> [3/3] Final review"
+bash tools/pre_pr_review.sh
+
+if command -v bat >/dev/null 2>&1; then
+  bat "$OUT"
+else
+  ${PAGER:-cat} "$OUT"
+fi
+
+echo ">>> Done. Review is in $OUT"
+EOF
+chmod +x tools/code.sh
+
+# Symlink 'code' globally for Codex
+sudo ln -sf "$(pwd)/tools/code.sh" /usr/local/bin/code || true
+append_once_to_bashrc 'alias code="bash tools/code.sh"'
+
 # -----------------------------
 # Summary
 # -----------------------------
@@ -295,18 +321,13 @@ echo
 echo "Summary:"
 echo "  venv:           $HOME/.llm-env"
 echo "  review CLI:     /usr/local/bin/review"
-echo "  helper scripts: tools/pre_pr_review.sh, tools/auto_fix_from_review.sh"
+echo "  helper scripts: tools/pre_pr_review.sh, tools/auto_fix_from_review.sh, tools/code.sh"
+echo "  alias:          code"
 echo
-echo "API keys (env seen now):"
+echo "API keys:"
 [[ -n "${OPENAI_API_KEY:-}" ]] && echo "  OpenAI: set" || echo "  OpenAI: MISSING"
 [[ -n "${ANTHROPIC_API_KEY:-}" ]] && echo "  Anthropic: set" || echo "  Anthropic: MISSING"
-[[ -n "${LLM_GEMINI_KEY:-}" ]] && echo "  Google/Gemini: set" || echo "  Google/Gemini: MISSING"
+[[ -n "${LLM_GEMINI_KEY:-}" ]] && echo "  Gemini: set" || echo "  Gemini: MISSING"
 echo
-echo "Default models:"
-echo "  ${LLM_MODELS}"
-echo
-echo "Typical pre-PR sequence:"
-echo "  bash tools/pre_pr_review.sh"
-echo "  bash tools/auto_fix_from_review.sh .ai-review.md || true"
-echo "  bash tools/pre_pr_review.sh"
-echo '  gh pr create --fill --body-file .ai-review.md --title "chore: codex update" --base "$(git remote show origin | sed -n '\''/HEAD branch/s/.*: //p'\'')"'
+echo "To trigger full 3-stage review flow, press Codex 'Code' or run:"
+echo "  code"
