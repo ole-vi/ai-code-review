@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log() { printf "\n>>> %s\n" "$*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+append_once_to_bashrc() {
+  local line="$1"
+  grep -Fqx "$line" "$HOME/.bashrc" || echo "$line" >> "$HOME/.bashrc"
+}
+
+# -----------------------------
+# Base deps
+# -----------------------------
+log "Base packages"
+if have apt; then
+  sudo apt-get update -qq
+  sudo apt-get install -y --no-install-recommends curl ca-certificates git python3 python3-venv
+fi
+
+# -----------------------------
+# Python venv + llm + plugins
+# -----------------------------
+log "Python venv for llm"
+python3 -m venv "$HOME/.llm-env"
+# shellcheck disable=SC1091
+source "$HOME/.llm-env/bin/activate"
+pip install --upgrade pip
+pip install llm llm-claude llm-gemini
+
+append_once_to_bashrc 'source ~/.llm-env/bin/activate'
+export PATH="$HOME/.llm-env/bin:$PATH"
+
+# -----------------------------
+# Optional: bat pager
+# -----------------------------
+if have apt && ! have bat; then
+  log "Installing bat (optional pretty pager)"
+  sudo apt-get install -y bat >/dev/null
+  sudo ln -sf /usr/bin/batcat /usr/local/bin/bat || true
+fi
+
+# -----------------------------
+# Install the review CLI
+# -----------------------------
+log "Install review CLI"
+sudo curl -fsSL https://raw.githubusercontent.com/ole-vi/ai-code-review/main/review -o /usr/local/bin/review
+sudo chmod +x /usr/local/bin/review
+
+# -----------------------------
+# Wire secrets to llm (persist + env)
+#   - OPENAI_API_KEY
+#   - ANTHROPIC_API_KEY
+#   - GOOGLE_API_KEY -> LLM_GEMINI_KEY
+# Notes:
+#   * Use --value to avoid interactive hangs
+#   * Also write exports to ~/.bashrc so shells have env fallbacks
+# -----------------------------
+log "Wire secrets to llm (persist + env)"
+
+# OpenAI
+if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+  export OPENAI_API_KEY
+  llm keys set openai --value "$OPENAI_API_KEY" >/dev/null
+  append_once_to_bashrc 'export OPENAI_API_KEY=${OPENAI_API_KEY:-'"$OPENAI_API_KEY"'}'
+  echo "OpenAI key: set (persisted to llm + bashrc)"
+else
+  echo "OpenAI key: MISSING"
+fi
+
+# Anthropic (Claude)
+if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+  export ANTHROPIC_API_KEY
+  llm keys set anthropic --value "$ANTHROPIC_API_KEY" >/dev/null
+  append_once_to_bashrc 'export ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-'"$ANTHROPIC_API_KEY"'}'
+  echo "Anthropic key: set (persisted to llm + bashrc)"
+else
+  echo "Anthropic key: MISSING"
+fi
+
+# Gemini (map GOOGLE_API_KEY -> LLM_GEMINI_KEY used by llm-gemini)
+if [[ -n "${GOOGLE_API_KEY:-}" ]]; then
+  export LLM_GEMINI_KEY="$GOOGLE_API_KEY"
+  llm keys set gemini --value "$LLM_GEMINI_KEY" >/dev/null
+  append_once_to_bashrc 'export LLM_GEMINI_KEY=${LLM_GEMINI_KEY:-'"$LLM_GEMINI_KEY"'}'
+  echo "Gemini key: set (from GOOGLE_API_KEY; persisted to llm + bashrc)"
+else
+  echo "Gemini key: MISSING (no GOOGLE_API_KEY secret)"
+fi
+
+# Default model list (fix Claude id: drop provider prefix)
+DEFAULT_MODELS='gpt-4o,gemini/gemini-1.5-flash-latest,claude-3-7-sonnet-latest'
+if [[ -z "${LLM_MODELS:-}" ]]; then
+  export LLM_MODELS="$DEFAULT_MODELS"
+  append_once_to_bashrc 'export LLM_MODELS=${LLM_MODELS:-'"$DEFAULT_MODELS"'}'
+else
+  append_once_to_bashrc 'export LLM_MODELS=${LLM_MODELS:-'"$LLM_MODELS"'}'
+fi
+
+# -----------------------------
+# GitHub CLI (optional helper)
+# -----------------------------
+if have gh; then
+  log "gh already installed"
+else
+  log "Installing GitHub CLI"
+  if have apt; then
+    sudo mkdir -p /etc/apt/keyrings
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+    sudo apt-get update -qq && sudo apt-get install -y gh
+  fi
+fi
+
+# If this is running inside a repo, try to set gh default (best-effort)
+if [[ -d .git ]] && have gh; then
+  log "Configuring gh default for current repo (best-effort)"
+  gh repo set-default "$(git remote get-url origin 2>/dev/null | sed -E 's#https?://github.com/##; s/\.git$//')" || true
+fi
+
+# -----------------------------
+# Write helper scripts
+# -----------------------------
+mkdir -p tools
+
+# Pre-PR review runner (uses fixed Claude id)
+cat > tools/pre_pr_review.sh <<"EOF"
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Activate llm venv if present
+if [ -f "$HOME/.llm-env/bin/activate" ]; then
+  # shellcheck disable=SC1091
+  source "$HOME/.llm-env/bin/activate"
+fi
+export PATH="$HOME/.llm-env/bin:$PATH"
+
+# Determine default branch (prefer remote HEAD if available)
+DEFAULT_BRANCH="${DEFAULT_BRANCH:-$(git remote show origin 2>/dev/null | sed -n '/HEAD branch/s/.*: //p')}"
+DEFAULT_BRANCH="${DEFAULT_BRANCH:-master}"
+
+# Ensure we have the base ref locally if origin exists
+if git remote get-url origin >/dev/null 2>&1; then
+  git fetch origin "$DEFAULT_BRANCH" --depth=1 >/dev/null 2>&1 || true
+  BASE="origin/${DEFAULT_BRANCH}"
+else
+  BASE="${DEFAULT_BRANCH}"
+fi
+
+COMPARE_RANGE="${COMPARE_RANGE:-${BASE}...HEAD}"
+
+# Use corrected Claude id (no anthropic/ prefix)
+MODELS="${LLM_MODELS:-gpt-4o,gemini/gemini-1.5-flash-latest,claude-3-7-sonnet-latest}"
+OUT="${OUT:-.ai-review.md}"
+
+echo ">>> Running AI review for ${COMPARE_RANGE} with models: ${MODELS}"
+review --models "${MODELS}" "${COMPARE_RANGE}" | tee "${OUT}"
+echo ">>> Review saved to ${OUT}"
+EOF
+chmod +x tools/pre_pr_review.sh
+
+# Auto-fix helper (unchanged except for venv activation)
+cat > tools/auto_fix_from_review.sh <<"EOF"
+#!/usr/bin/env bash
+set -euo pipefail
+
+REVIEW_FILE="${1:-.ai-review.md}"
+MODEL="${MODEL:-gpt-4o-mini}"
+PATCH_FILE="${PATCH_FILE:-.ai-autofix.patch}"
+
+# Activate llm venv if present
+if [ -f "$HOME/.llm-env/bin/activate" ]; then
+  # shellcheck disable=SC1091
+  source "$HOME/.llm-env/bin/activate"
+fi
+export PATH="$HOME/.llm-env/bin:$PATH"
+
+if [ ! -s "$REVIEW_FILE" ]; then
+  echo "No review file at $REVIEW_FILE"
+  exit 0
+fi
+
+DEFAULT_BRANCH="${DEFAULT_BRANCH:-$(git remote show origin 2>/dev/null | sed -n '/HEAD branch/s/.*: //p')}"
+DEFAULT_BRANCH="${DEFAULT_BRANCH:-master}"
+BASE_RANGE="${BASE_RANGE:-origin/${DEFAULT_BRANCH}...HEAD}"
+if ! git remote get-url origin >/dev/null 2>&1; then
+  BASE_RANGE="${DEFAULT_BRANCH}...HEAD"
+fi
+
+CURRENT_DIFF="$(git diff "${BASE_RANGE}")"
+if [ -z "$CURRENT_DIFF" ]; then
+  echo "No diff to fix."
+  exit 0
+fi
+
+echo ">>> Requesting minimal unified diff from ${MODEL}"
+llm -m "${MODEL}" --system '
+You output ONLY a valid unified diff patch suitable for git apply.
+Do not include commentary.
+Change only files already present in the provided diff.
+Make the smallest set of changes necessary to resolve BLOCKING issues from the review.
+' --prompt '
+=== REVIEW (markdown) ===
+'"$(cat "$REVIEW_FILE")"'
+
+=== CURRENT UNIFIED DIFF ===
+'"$CURRENT_DIFF"'
+
+=== INSTRUCTIONS ===
+Return ONLY a unified diff starting with ---/+++ headers and @@ hunks. No prose.
+' > "${PATCH_FILE}" || true
+
+if [ ! -s "${PATCH_FILE}" ]; then
+  echo "Model produced no patch. Skipping."
+  exit 0
+fi
+
+echo ">>> Applying patch with 3 way merge"
+set +e
+git apply --3way --reject "${PATCH_FILE}"
+APPLY_STATUS=$?
+set -e
+
+if [ $APPLY_STATUS -ne 0 ]; then
+  echo "Patch did not apply cleanly. Leaving ${PATCH_FILE} for manual review."
+  exit 0
+fi
+
+if ! git diff --quiet; then
+  git add -A
+  git commit -m "ai: address review suggestions (auto-fix pass)"
+  echo ">>> Committed auto fix changes."
+else
+  echo ">>> Patch applied but no changes detected."
+fi
+EOF
+chmod +x tools/auto_fix_from_review.sh
+
+# -----------------------------
+# Summary
+# -----------------------------
+echo
+echo "Summary:"
+echo "  venv:           $HOME/.llm-env"
+echo "  review CLI:     /usr/local/bin/review"
+echo "  helper scripts: tools/pre_pr_review.sh, tools/auto_fix_from_review.sh"
+echo
+echo "API keys (env seen now):"
+[[ -n "${OPENAI_API_KEY:-}" ]] && echo "  OpenAI: set" || echo "  OpenAI: MISSING"
+[[ -n "${ANTHROPIC_API_KEY:-}" ]] && echo "  Anthropic: set" || echo "  Anthropic: MISSING"
+[[ -n "${LLM_GEMINI_KEY:-}" ]] && echo "  Google/Gemini: set" || echo "  Google/Gemini: MISSING"
+echo
+echo "Default models:"
+echo "  ${LLM_MODELS}"
+echo
+echo "Typical pre-PR sequence:"
+echo "  bash tools/pre_pr_review.sh"
+echo "  bash tools/auto_fix_from_review.sh .ai-review.md || true"
+echo "  bash tools/pre_pr_review.sh"
+echo '  gh pr create --fill --body-file .ai-review.md --title "chore: codex update" --base "$(git remote show origin | sed -n '\''/HEAD branch/s/.*: //p'\'')"'
