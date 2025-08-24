@@ -1,333 +1,77 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-log() { printf "\n>>> %s\n" "$*"; }
-have() { command -v "$1" >/dev/null 2>&1; }
-append_once_to_bashrc() {
-  local line="$1"
-  grep -Fqx "$line" "$HOME/.bashrc" || echo "$line" >> "$HOME/.bashrc"
-}
+# --- 0) Tiny helpers ---------------------------------------------------------
+log(){ printf ">> %s\n" "$*"; }
 
-# -----------------------------
-# Base deps
-# -----------------------------
-log "Base packages"
-if have apt; then
+# --- 1) System deps (quiet, minimal) -----------------------------------------
+if ! command -v gh >/dev/null 2>&1; then
+  log "Installing GitHub CLI"
+  sudo mkdir -p /etc/apt/keyrings
+  curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
   sudo apt-get update -qq
-  sudo apt-get install -y --no-install-recommends curl ca-certificates git python3 python3-venv
+  sudo apt-get install -y gh >/dev/null
 fi
 
-# -----------------------------
-# Python venv + llm + plugins
-# -----------------------------
-log "Python venv for llm"
-python3 -m venv "$HOME/.llm-env"
+# (optional pretty output)
+if ! command -v bat >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+  sudo apt-get update -qq && sudo apt-get install -y bat >/dev/null || true
+  command -v batcat >/dev/null 2>&1 && sudo ln -sf /usr/bin/batcat /usr/local/bin/bat || true
+fi
+
+# --- 2) Python venv + llm + providers ---------------------------------------
+log "Setting up llm CLI"
+if [ ! -d "$HOME/.llm-env" ]; then
+  python3 -m venv "$HOME/.llm-env"
+fi
 # shellcheck disable=SC1091
 source "$HOME/.llm-env/bin/activate"
-pip install --upgrade pip
-pip install llm llm-claude llm-gemini
+python3 -m pip -q install --upgrade pip llm llm-anthropic llm-gemini
 
-append_once_to_bashrc 'source ~/.llm-env/bin/activate'
-export PATH="$HOME/.llm-env/bin:$PATH"
-
-# -----------------------------
-# Optional: bat pager
-# -----------------------------
-if have apt && ! have bat; then
-  log "Installing bat (optional pretty pager)"
-  sudo apt-get install -y bat >/dev/null
-  sudo ln -sf /usr/bin/batcat /usr/local/bin/bat || true
+# Ensure llm is on PATH for all shells
+if ! grep -q 'source ~/.llm-env/bin/activate' "$HOME/.bashrc" 2>/dev/null; then
+  echo 'source ~/.llm-env/bin/activate' >> "$HOME/.bashrc"
 fi
 
-# -----------------------------
-# Install the review CLI
-# -----------------------------
-log "Install review CLI"
-sudo curl -fsSL https://raw.githubusercontent.com/ole-vi/ai-code-review/main/review -o /usr/local/bin/review
+# --- 3) Keys from Codex secrets (if present) ---------------------------------
+# Expected secrets: OPENAI_API_KEY, GOOGLE_API_KEY, ANTHROPIC_API_KEY
+[ -n "${OPENAI_API_KEY:-}" ]    && llm keys set openai    --value "$OPENAI_API_KEY"    || true
+[ -n "${GOOGLE_API_KEY:-}" ]    && llm keys set google    --value "$GOOGLE_API_KEY"    || true
+[ -n "${GOOGLE_API_KEY:-}" ]    && llm keys set gemini    --value "$GOOGLE_API_KEY"    || true   # <— added; harmless + helps
+[ -n "${ANTHROPIC_API_KEY:-}" ] && llm keys set anthropic --value "$ANTHROPIC_API_KEY" || true
+
+# --- 4) Review script ---------------------------------------------------------
+# Pull the latest review CLI (light wrapper around git diff + llm)
+if [ ! -x /usr/local/bin/review-core ]; then
+  sudo curl -fsSL https://raw.githubusercontent.com/ole-vi/ai-code-review/main/review -o /usr/local/bin/review-core
+  sudo chmod +x /usr/local/bin/review-core
+fi
+
+# Wrap it so "review master...HEAD" always uses all 3 models
+sudo tee /usr/local/bin/review >/dev/null <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+# If --models not provided, use LLM_MODELS or our default trio
+want_models=""
+for arg in "$@"; do
+  if [ "$arg" = "--models" ]; then want_models="set"; break; fi
+done
+if [ -z "${want_models}" ]; then
+  MODELS="${LLM_MODELS:-gpt-4o,gemini-2.0-flash,anthropic/claude-3-7-sonnet-latest}"  # <— changed
+  exec /usr/local/bin/review-core --models "$MODELS" "$@"
+else
+  exec /usr/local/bin/review-core "$@"
+fi
+SH
 sudo chmod +x /usr/local/bin/review
 
-# -----------------------------
-# Wire secrets to llm (persist + env)
-# -----------------------------
-log "Wire secrets to llm (persist + env)"
-
-# OpenAI
-if [[ -n "${OPENAI_API_KEY:-}" ]]; then
-  export OPENAI_API_KEY
-  llm keys set openai --value "$OPENAI_API_KEY" >/dev/null
-  append_once_to_bashrc 'export OPENAI_API_KEY=${OPENAI_API_KEY:-'"$OPENAI_API_KEY"'}'
-  echo "OpenAI key: set (persisted to llm + bashrc)"
-else
-  echo "OpenAI key: MISSING"
+# --- 5) Persist model list for all future shells -----------------------------
+if ! grep -q 'export LLM_MODELS=' "$HOME/.bashrc" 2>/dev/null; then
+  echo 'export LLM_MODELS="gpt-4o,gemini-2.0-flash,anthropic/claude-3-7-sonnet-latest"' >> "$HOME/.bashrc"  # <— changed
 fi
 
-# Anthropic (Claude)
-if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
-  export ANTHROPIC_API_KEY
-  llm keys set anthropic --value "$ANTHROPIC_API_KEY" >/dev/null
-  append_once_to_bashrc 'export ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-'"$ANTHROPIC_API_KEY"'}'
-  echo "Anthropic key: set (persisted to llm + bashrc)"
-else
-  echo "Anthropic key: MISSING"
-fi
+log "Done. After startup, run:  review master...HEAD"
 
-# Gemini
-if [[ -n "${GOOGLE_API_KEY:-}" ]]; then
-  export LLM_GEMINI_KEY="$GOOGLE_API_KEY"
-  llm keys set gemini --value "$LLM_GEMINI_KEY" >/dev/null
-  append_once_to_bashrc 'export LLM_GEMINI_KEY=${LLM_GEMINI_KEY:-'"$LLM_GEMINI_KEY"'}'
-  echo "Gemini key: set (from GOOGLE_API_KEY; persisted to llm + bashrc)"
-else
-  echo "Gemini key: MISSING (no GOOGLE_API_KEY secret)"
-fi
 
-# Default model list
-DEFAULT_MODELS='gpt-4o,gemini/gemini-1.5-flash-latest,claude-3-5-sonnet-latest'
-if [[ -z "${LLM_MODELS:-}" ]]; then
-  export LLM_MODELS="$DEFAULT_MODELS"
-  append_once_to_bashrc 'export LLM_MODELS=${LLM_MODELS:-'"$DEFAULT_MODELS"'}'
-else
-  append_once_to_bashrc 'export LLM_MODELS=${LLM_MODELS:-'"$LLM_MODELS"'}'
-fi
-
-# -----------------------------
-# GitHub CLI (optional helper)
-# -----------------------------
-if have gh; then
-  log "gh already installed"
-else
-  log "Installing GitHub CLI"
-  if have apt; then
-    sudo mkdir -p /etc/apt/keyrings
-    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-      | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
-    sudo apt-get update -qq && sudo apt-get install -y gh
-  fi
-fi
-
-if [[ -d .git ]] && have gh; then
-  log "Configuring gh default for current repo (best-effort)"
-  gh repo set-default "$(git remote get-url origin 2>/dev/null | sed -E 's#https?://github.com/##; s/\.git$//')" || true
-fi
-
-# -----------------------------
-# Helper scripts
-# -----------------------------
-mkdir -p tools
-
-# Pre-PR review runner
-cat > tools/pre_pr_review.sh <<"EOF"
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [ -f "$HOME/.llm-env/bin/activate" ]; then
-  source "$HOME/.llm-env/bin/activate"
-fi
-export PATH="$HOME/.llm-env/bin:$PATH"
-
-DEFAULT_BRANCH="${DEFAULT_BRANCH:-$(git remote show origin 2>/dev/null | sed -n '/HEAD branch/s/.*: //p')}"
-DEFAULT_BRANCH="${DEFAULT_BRANCH:-master}"
-
-if git remote get-url origin >/dev/null 2>&1; then
-  git fetch origin "$DEFAULT_BRANCH" --depth=1 >/dev/null 2>&1 || true
-  BASE="origin/${DEFAULT_BRANCH}"
-else
-  BASE="${DEFAULT_BRANCH}"
-fi
-
-COMPARE_RANGE="${COMPARE_RANGE:-${BASE}...HEAD}"
-
-detect_claude_sonnet() {
-  local candidates=(
-    "claude-3-5-sonnet-20241022"
-    "claude-3-5-sonnet-latest"
-    "claude-3-5-sonnet"
-    "claude-3-sonnet-20240229"
-    "claude-3-sonnet"
-  )
-  local available
-  available="$(llm models -n 2>/dev/null || true)"
-  for m in "${candidates[@]}"; do
-    if printf '%s\n' "$available" | grep -qx "$m"; then
-      printf '%s' "$m"
-      return 0
-    fi
-  done
-  return 1
-}
-
-build_models() {
-  local base="gpt-4o,gemini/gemini-1.5-flash-latest"
-  local claude_model=""
-  claude_model="$(detect_claude_sonnet || true)"
-
-  if [ -n "${LLM_MODELS:-}" ]; then
-    local filtered=""
-    local available
-    IFS=',' read -r -a requested <<<"$LLM_MODELS"
-    available="$(llm models -n 2>/dev/null || true)"
-    for m in "${requested[@]}"; do
-      m="$(printf '%s' "$m" | awk '{$1=$1};1')"
-      if printf '%s\n' "$available" | grep -qx "$m"; then
-        filtered="${filtered:+$filtered,}$m"
-      fi
-    done
-    if [ -n "$filtered" ]; then
-      printf '%s' "$filtered"
-      return
-    fi
-  fi
-
-  if [ -n "$claude_model" ]; then
-    printf '%s,%s' "$base" "$claude_model"
-  else
-    echo "Note: no supported Claude Sonnet model found (skipping Claude)." >&2
-    printf '%s' "$base"
-  fi
-}
-
-MODELS="$(build_models)"
-OUT="${OUT:-.ai-review.md}"
-
-echo ">>> Running AI review for ${COMPARE_RANGE} with models: ${MODELS}"
-review --models "${MODELS}" "${COMPARE_RANGE}" | tee "${OUT}"
-echo ">>> Review saved to ${OUT}"
-EOF
-chmod +x tools/pre_pr_review.sh
-
-# Auto-fix helper
-cat > tools/auto_fix_from_review.sh <<"EOF"
-#!/usr/bin/env bash
-set -euo pipefail
-
-REVIEW_FILE="${1:-.ai-review.md}"
-MODEL="${MODEL:-gpt-4o-mini}"
-PATCH_FILE="${PATCH_FILE:-.ai-autofix.patch}"
-
-if [ -f "$HOME/.llm-env/bin/activate" ]; then
-  source "$HOME/.llm-env/bin/activate"
-fi
-export PATH="$HOME/.llm-env/bin:$PATH"
-
-if [ ! -s "$REVIEW_FILE" ]; then
-  echo "No review file at $REVIEW_FILE"
-  exit 0
-fi
-
-DEFAULT_BRANCH="${DEFAULT_BRANCH:-$(git remote show origin 2>/dev/null | sed -n '/HEAD branch/s/.*: //p')}"
-DEFAULT_BRANCH="${DEFAULT_BRANCH:-master}"
-BASE_RANGE="${BASE_RANGE:-origin/${DEFAULT_BRANCH}...HEAD}"
-if ! git remote get-url origin >/dev/null 2>&1; then
-  BASE_RANGE="${DEFAULT_BRANCH}...HEAD"
-fi
-
-CURRENT_DIFF="$(git diff "${BASE_RANGE}")"
-if [ -z "$CURRENT_DIFF" ]; then
-  echo "No diff to fix."
-  exit 0
-fi
-
-echo ">>> Requesting minimal unified diff from ${MODEL}"
-llm -m "${MODEL}" --system '
-You output ONLY a valid unified diff patch suitable for git apply.
-Do not include commentary.
-Change only files already present in the provided diff.
-Make the smallest set of changes necessary to resolve BLOCKING issues from the review.
-' --prompt '
-=== REVIEW (markdown) ===
-'"$(cat "$REVIEW_FILE")"'
-
-=== CURRENT UNIFIED DIFF ===
-'"$CURRENT_DIFF"'
-
-=== INSTRUCTIONS ===
-Return ONLY a unified diff starting with ---/+++ headers and @@ hunks. No prose.
-' > "${PATCH_FILE}" || true
-
-if [ ! -s "${PATCH_FILE}" ]; then
-  echo "Model produced no patch. Skipping."
-  exit 0
-fi
-
-echo ">>> Applying patch with 3 way merge"
-set +e
-git apply --3way --reject "${PATCH_FILE}"
-APPLY_STATUS=$?
-set -e
-
-if [ $APPLY_STATUS -ne 0 ]; then
-  echo "Patch did not apply cleanly. Leaving ${PATCH_FILE} for manual review."
-  exit 0
-fi
-
-if ! git diff --quiet; then
-  git add -A
-  git commit -m "ai: address review suggestions (auto-fix pass)"
-  echo ">>> Committed auto fix changes."
-else
-  echo ">>> Patch applied but no changes detected."
-fi
-EOF
-chmod +x tools/auto_fix_from_review.sh
-
-# Meta-runner for Codex "Code" button
-cat > tools/code.sh <<"EOF"
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [ -f "$HOME/.llm-env/bin/activate" ]; then
-  source "$HOME/.llm-env/bin/activate"
-fi
-export PATH="$HOME/.llm-env/bin:$PATH"
-
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-if [ -z "$REPO_ROOT" ]; then
-  echo "Not inside a Git repository."
-  exit 1
-fi
-cd "$REPO_ROOT"
-
-OUT="${OUT:-.ai-review.md}"
-
-echo ">>> [1/3] Pre-review"
-bash tools/pre_pr_review.sh
-
-echo ">>> [2/3] Auto-fix"
-bash tools/auto_fix_from_review.sh "$OUT" || true
-
-echo ">>> [3/3] Final review"
-bash tools/pre_pr_review.sh
-
-if command -v bat >/dev/null 2>&1; then
-  bat "$OUT"
-else
-  ${PAGER:-cat} "$OUT"
-fi
-
-echo ">>> Done. Review is in $OUT"
-EOF
-chmod +x tools/code.sh
-
-# Symlink 'code' globally for Codex
-sudo ln -sf "$(pwd)/tools/code.sh" /usr/local/bin/code || true
-append_once_to_bashrc 'alias code="bash tools/code.sh"'
-
-# -----------------------------
-# Summary
-# -----------------------------
-echo
-echo "Summary:"
-echo "  venv:           $HOME/.llm-env"
-echo "  review CLI:     /usr/local/bin/review"
-echo "  helper scripts: tools/pre_pr_review.sh, tools/auto_fix_from_review.sh, tools/code.sh"
-echo "  alias:          code"
-echo
-echo "API keys:"
-[[ -n "${OPENAI_API_KEY:-}" ]] && echo "  OpenAI: set" || echo "  OpenAI: MISSING"
-[[ -n "${ANTHROPIC_API_KEY:-}" ]] && echo "  Anthropic: set" || echo "  Anthropic: MISSING"
-[[ -n "${LLM_GEMINI_KEY:-}" ]] && echo "  Gemini: set" || echo "  Gemini: MISSING"
-echo
-echo "To trigger full 3-stage review flow, press Codex 'Code' or run:"
-echo "  code"
